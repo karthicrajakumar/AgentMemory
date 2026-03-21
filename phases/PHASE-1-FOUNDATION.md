@@ -1,6 +1,6 @@
 # Phase 1: Foundation
 
-> Status: DRAFT — pending discussion
+> Status: APPROVED — decisions locked in
 
 ## Goal
 
@@ -23,10 +23,10 @@ Set up the project skeleton and build the core primitives that every agent depen
 
 **Dev dependencies**: `typescript`, `vitest`, `eslint`, `prettier`
 
-**Open questions**:
-- Should we use a monorepo (e.g., separate `@replaybot/core`, `@replaybot/mcp`) or keep it as a single package?
-- Node.js minimum version — 18? 20?
-- ESM-only or dual CJS/ESM?
+**Decisions**:
+- **Single package** — no monorepo. Split later if needed.
+- **Node 20+** minimum — current LTS, native fetch, better perf.
+- **ESM-only** — `"type": "module"` in package.json, no CJS build.
 
 ---
 
@@ -40,10 +40,20 @@ interface BrowserController {
   launch(options?: LaunchOptions): Promise<void>;
   close(): Promise<void>;
 
-  // Page management
+  // Page management (multi-page support)
   currentPage(): Page;
+  pages(): Page[];
+  createPage(): Promise<Page>;
+  switchToPage(index: number): void;
+  onNewPage(handler: (page: Page) => void): void;
   navigateTo(url: string): Promise<void>;
   waitForNavigation(): Promise<void>;
+
+  // Browser pool for parallel exploration
+  acquireContext(): Promise<BrowserContext>;
+  releaseContext(context: BrowserContext): Promise<void>;
+  poolSize(): number;
+  setPoolSize(size: number): void;
 
   // Context management (for auth state)
   saveStorageState(path: string): Promise<void>;
@@ -53,12 +63,20 @@ interface BrowserController {
   setViewport(width: number, height: number): Promise<void>;
   setBrowserType(type: 'chromium' | 'firefox' | 'webkit'): void;
 }
+
+interface LaunchOptions {
+  headless?: boolean;      // Default: false (headed)
+  browserType?: 'chromium' | 'firefox' | 'webkit';
+  poolSize?: number;       // Default: 1
+  viewport?: { width: number; height: number };
+  storageStatePath?: string;
+}
 ```
 
-**Key decisions to discuss**:
-- Should we support multiple simultaneous pages/tabs?
-- Should the controller manage browser pool for parallel exploration?
-- Headless by default, headed for debugging? Or configurable?
+**Decisions**:
+- **Multi-page support** — track multiple tabs. Needed for OAuth popups, payment redirects, etc.
+- **Browser pool from the start** — manage N browser contexts for parallel exploration.
+- **Headed by default** — users see the browser. Pass `headless: true` for CI/silent mode.
 
 ---
 
@@ -69,12 +87,12 @@ Extracts page state for LLM consumption. This is the "eyes" of every agent.
 ```typescript
 interface PageObserver {
   // Core observations
-  getAccessibilityTree(page: Page): Promise<AccessibilityNode[]>;
-  getSimplifiedDOM(page: Page): Promise<string>;
-  takeScreenshot(page: Page): Promise<Buffer>;
+  getAccessibilityTree(page: Page): Promise<AccessibilityNode>;  // Hierarchical tree
+  getSimplifiedDOM(page: Page): Promise<string>;                  // Semantic-only
+  takeScreenshot(page: Page, options?: ScreenshotOptions): Promise<Buffer>;
 
   // Page identity
-  getPageFingerprint(page: Page): Promise<string>;
+  getPageFingerprint(page: Page): Promise<string>;  // Tag structure hash
   getPageMetadata(page: Page): Promise<PageMeta>;
 
   // Element discovery
@@ -86,11 +104,22 @@ interface PageObserver {
   observe(page: Page): Promise<PageObservation>;
 }
 
+interface ScreenshotOptions {
+  fullPage?: boolean;  // Default: false (viewport only)
+}
+
+interface AccessibilityNode {
+  role: string;
+  name: string;
+  children: AccessibilityNode[];
+  properties?: Record<string, string>;
+}
+
 interface PageObservation {
   url: string;
   title: string;
   fingerprint: string;
-  accessibilityTree: AccessibilityNode[];
+  accessibilityTree: AccessibilityNode;
   simplifiedDOM: string;
   screenshot: Buffer;
   interactiveElements: InteractiveElement[];
@@ -99,12 +128,12 @@ interface PageObservation {
 }
 ```
 
-**Key decisions to discuss**:
-- How aggressively should we simplify the DOM? Strip all styling? Only keep semantic elements?
-- Should the accessibility tree be flattened or preserve hierarchy?
-- Screenshot format — full page or viewport only? What resolution?
-- Should we include computed styles for any elements (e.g., visibility, color)?
-- DOM fingerprinting algorithm — hash the tag structure? Include text content?
+**Decisions**:
+- **Semantic-only DOM** — strip scripts, styles, SVGs, hidden elements. Keep headings, forms, links, buttons, landmarks.
+- **Preserve accessibility tree hierarchy** — tree structure matching DOM nesting with `children` arrays.
+- **Viewport screenshots by default** (1280x720), full page on demand via `fullPage: true`.
+- **No computed styles** — not included in observations.
+- **Tag structure hash** for fingerprinting — hash tag names + hierarchy, ignore text content. Fast and stable.
 
 ---
 
@@ -119,9 +148,12 @@ interface LLMProvider {
   // Core completion
   complete(request: LLMRequest): Promise<LLMResponse>;
 
+  // Streaming
+  stream(request: LLMRequest): AsyncIterable<LLMStreamChunk>;
+
   // Capabilities
   supportsVision(): boolean;
-  supportsTool_use(): boolean;
+  supportsToolUse(): boolean;
   maxContextTokens(): number;
 }
 
@@ -132,7 +164,14 @@ interface LLMRequest {
   temperature?: number;
   maxTokens?: number;
   tools?: ToolDefinition[];    // For structured output
-  modelTier: 'fast' | 'capable';  // Scout uses 'fast', others use 'capable'
+  modelTier: 'fast' | 'balanced' | 'premium';
+  agentId?: string;            // For cost tracking attribution
+}
+
+interface LLMStreamChunk {
+  type: 'text' | 'tool_call_start' | 'tool_call_delta' | 'tool_call_end' | 'done';
+  content?: string;
+  toolCall?: Partial<ToolCall>;
 }
 
 interface LLMResponse {
@@ -144,18 +183,38 @@ interface LLMResponse {
 // Configuration
 interface LLMConfig {
   provider: 'anthropic' | 'openai' | string;
-  fastModel: string;      // e.g., 'claude-haiku-4-5-20251001'
-  capableModel: string;   // e.g., 'claude-sonnet-4-6'
+  fastModel: string;       // e.g., 'claude-haiku-4-5-20251001'
+  balancedModel: string;   // e.g., 'claude-sonnet-4-6'
+  premiumModel: string;    // e.g., 'claude-opus-4-6'
   apiKey: string;
+  rateLimits?: {
+    maxRequestsPerMinute: number;
+    maxTokensPerMinute: number;
+  };
+}
+
+// Cost tracking
+interface UsageTracker {
+  record(agentId: string, usage: { inputTokens: number; outputTokens: number; model: string }): void;
+  getAgentUsage(agentId: string): AgentUsage;
+  getSessionUsage(): SessionUsage;
+  reset(): void;
+}
+
+interface AgentUsage {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  estimatedCost: number;
+  requestCount: number;
+  byModel: Record<string, { inputTokens: number; outputTokens: number; requests: number }>;
 }
 ```
 
-**Key decisions to discuss**:
-- Should we support streaming for real-time exploration feedback?
-- How to handle rate limiting and retries?
-- Should the interface support tool use / structured output natively?
-- Cost tracking — should we track token usage per agent per session?
-- Should `modelTier` be more granular (e.g., 'cheap', 'balanced', 'premium')?
+**Decisions**:
+- **Streaming from the start** — `stream()` method returns `AsyncIterable<LLMStreamChunk>` for real-time feedback.
+- **Token bucket + exponential backoff** — client-side rate limiter (configurable requests/min and tokens/min) plus retry on 429/5xx.
+- **Per-agent cost tracking** — `UsageTracker` records tokens by agent ID and model. Reports cost breakdown.
+- **Three model tiers** — `fast` (Haiku), `balanced` (Sonnet), `premium` (Opus). Agents declare which tier they need.
 
 ---
 
@@ -174,13 +233,18 @@ interface PageStateManager {
   getTargetPage(): string | null;
   getPathTo(targetUrl: string): NavigationStep[];
 
-  // Knowledge base
+  // Knowledge base (last-write-wins)
   addPageKnowledge(url: string, knowledge: PageKnowledge): void;
   getPageKnowledge(url: string): PageKnowledge | null;
+  getAllKnowledge(): Map<string, PageKnowledge>;
 
   // Fingerprinting (SPA support)
   registerFingerprint(fingerprint: string, virtualPage: VirtualPage): void;
   lookupFingerprint(fingerprint: string): VirtualPage | null;
+
+  // Persistence
+  save(path?: string): Promise<void>;
+  load(path?: string): Promise<void>;
 }
 
 interface PageState {
@@ -200,10 +264,10 @@ interface PageKnowledge {
 }
 ```
 
-**Key decisions to discuss**:
-- In-memory only, or persist to disk between sessions?
-- Should page knowledge expire/refresh after a configurable TTL?
-- How to handle conflicting knowledge (e.g., page changed between visits)?
+**Decisions**:
+- **Persist to disk** — save to `.replaybot/state.json` on every write. Resume across sessions.
+- **No TTL** — knowledge persists until explicitly re-explored by an agent.
+- **Last write wins** — newer observations replace older. No version history for v1.
 
 ---
 
@@ -224,7 +288,7 @@ interface ActionExecutor {
   // Selector resolution with chaining/fallback
   resolveSelector(selectors: SelectorChain): Promise<ResolvedSelector>;
 
-  // Waiting
+  // Waiting (Playwright auto-wait handles most cases)
   waitForElement(selectors: SelectorChain, timeout?: number): Promise<ActionResult>;
   waitForNavigation(timeout?: number): Promise<ActionResult>;
 }
@@ -233,22 +297,25 @@ interface SelectorChain {
   selectors: Array<{
     strategy: 'aria' | 'testid' | 'css' | 'text' | 'xpath';
     value: string;
+    timeout?: number;  // Default: 5000ms per selector
   }>;
+  totalTimeout?: number;   // Default: 15000ms for entire chain
 }
 
 interface ActionResult {
   success: boolean;
   usedSelector: { strategy: string; value: string };  // Which selector worked
   error?: string;
-  duration: number;  // ms
+  duration: number;    // ms — recorded for replay timing
+  timestamp: number;   // When action was executed
 }
 ```
 
-**Key decisions to discuss**:
-- Should actions auto-wait for elements (Playwright's auto-waiting) or explicit waits?
-- Timeout defaults — how long to wait for each selector before trying the next?
-- Should we record timing between actions for realistic replay speed?
-- How to handle iframes and shadow DOM?
+**Decisions**:
+- **Playwright auto-wait** — rely on Playwright's built-in auto-waiting (visible, stable, enabled).
+- **5s per selector, 15s total** — try each selector in chain for up to 5s, fail the entire chain after 15s.
+- **Skip iframes/shadow DOM for v1** — handle in a later phase.
+- **Record timing** — `duration` and `timestamp` on every `ActionResult` for realistic replay speed.
 
 ---
 

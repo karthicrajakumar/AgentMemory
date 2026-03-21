@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.replaybot/
+*.tsbuildinfo
+.env
+.env.local
