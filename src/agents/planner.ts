@@ -15,6 +15,8 @@ import type { SelectorChain, SelectorEntry } from '../types/index.js';
 
 // ── Plan Types ──────────────────────────────────────────────────
 
+const MAX_STEPS_PER_PLAN = 20;
+
 export interface TestPlan {
   id: string;
   goal: string;
@@ -22,6 +24,7 @@ export interface TestPlan {
   parameters: ParameterDef[];
   steps: TestStep[];
   assertions: PlannedAssertion[];
+  subPlans?: TestPlan[]; // Split when steps exceed MAX_STEPS_PER_PLAN
 }
 
 export interface TestStep {
@@ -147,7 +150,8 @@ Guidelines:
 - Use parameters for user-specific values (emails, passwords, names)
 - Include assertions after important actions
 - Set onFailure to "abort" for critical steps, "skip" for non-critical, "retry" for flaky operations
-- Be specific in targetDescription (e.g., "the email input field in the login form" not just "email input")`;
+- Be specific in targetDescription (e.g., "the email input field in the login form" not just "email input")
+- IMPORTANT: Keep the plan to ${MAX_STEPS_PER_PLAN} steps or fewer. If the flow requires more, focus on the most critical path.`;
 
     const response = await this.context.llm.complete({
       systemPrompt: 'You are a web application test planner. Generate detailed, executable test plans. Respond with valid JSON only.',
@@ -158,7 +162,52 @@ Guidelines:
       maxTokens: 4000,
     });
 
-    return this.parsePlan(response, goal);
+    const plan = this.parsePlan(response, goal);
+
+    // Split into sub-plans if exceeding max steps
+    if (plan.steps.length > MAX_STEPS_PER_PLAN) {
+      return this.splitIntoSubPlans(plan);
+    }
+
+    return plan;
+  }
+
+  /**
+   * Split a large plan into sub-plans of MAX_STEPS_PER_PLAN steps each.
+   * Each sub-plan inherits parameters and preconditions from the parent.
+   */
+  private splitIntoSubPlans(plan: TestPlan): TestPlan {
+    const subPlans: TestPlan[] = [];
+    const totalSteps = plan.steps;
+
+    for (let i = 0; i < totalSteps.length; i += MAX_STEPS_PER_PLAN) {
+      const chunk = totalSteps.slice(i, i + MAX_STEPS_PER_PLAN);
+      const partNum = Math.floor(i / MAX_STEPS_PER_PLAN) + 1;
+      const totalParts = Math.ceil(totalSteps.length / MAX_STEPS_PER_PLAN);
+
+      // Collect assertions that belong to this chunk's steps
+      const stepIds = new Set(chunk.map((s) => String(s.order)));
+      const stepIdSet = new Set(chunk.map((s) => s.id));
+      const chunkAssertions = plan.assertions.filter(
+        (a) => stepIds.has(a.afterStepId) || stepIdSet.has(a.afterStepId),
+      );
+
+      subPlans.push({
+        id: `${plan.id}-part${partNum}`,
+        goal: `${plan.goal} (part ${partNum}/${totalParts})`,
+        preconditions: partNum === 1 ? plan.preconditions : [`Part ${partNum - 1} completed successfully`],
+        parameters: plan.parameters,
+        steps: chunk,
+        assertions: chunkAssertions,
+      });
+    }
+
+    return {
+      ...plan,
+      steps: plan.steps.slice(0, MAX_STEPS_PER_PLAN), // Root plan contains first chunk
+      assertions: subPlans[0]?.assertions ?? [],
+      subPlans: subPlans.length > 1 ? subPlans.slice(1) : undefined,
+    };
   }
 
   /**
@@ -255,6 +304,39 @@ Return the updated plan in the same JSON format. Only change what's necessary to
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       errors.push({ stepId: 'execution', error: msg });
+    }
+
+    // Execute sub-plans if any (plans split due to > MAX_STEPS_PER_PLAN)
+    if (plan.subPlans && stepsFailed === 0) {
+      for (const subPlan of plan.subPlans) {
+        this.checkAborted(options?.signal);
+        this.checkBudget();
+
+        for (const step of subPlan.steps) {
+          this.checkAborted(options?.signal);
+          this.checkBudget();
+
+          const result = await this.executeStep(step, paramValues, options);
+          if (result.success) {
+            stepsExecuted++;
+            const stepAssertions = subPlan.assertions.filter(
+              (a) => a.afterStepId === String(step.order) || a.afterStepId === step.id,
+            );
+            for (const assertion of stepAssertions) {
+              const assertResult = await this.executeAssertion(assertion);
+              if (assertResult.pass) assertionsPassed++;
+              else assertionsFailed++;
+            }
+          } else {
+            stepsFailed++;
+            errors.push({ stepId: step.id, error: result.error ?? 'Unknown error' });
+            if (step.onFailure === 'abort') break;
+            if (step.onFailure === 'skip') stepsSkipped++;
+          }
+        }
+
+        if (stepsFailed > 0) break; // Stop sub-plan chain on failure
+      }
     }
 
     // Stop recording

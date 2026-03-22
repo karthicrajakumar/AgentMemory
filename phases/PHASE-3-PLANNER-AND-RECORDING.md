@@ -9,20 +9,22 @@ Build the Planner agent that turns high-level test goals into step-by-step plans
 
 ## Design Decisions
 
-| Decision | Choice |
-|---|---|
-| Planning strategy | Hybrid: generate full plan upfront, adapt step-by-step during execution |
-| Preconditions | Planner generates setup steps (e.g., login) as part of the plan |
-| LLM tier for planning | Balanced (Sonnet) for plan generation, Fast (Haiku) for element finding |
-| Screenshots | Opt-in (off by default), stored in separate directory |
-| Assertions | Soft by default (continue on failure, record result) |
-| Parameters | Auto-detect during recording (email, password, username, numbers) |
-| File naming | `{name-slugified}-{short-id}.json` |
-| Visual baselines | Auto-capture on first run (Jest snapshot style) |
-| Playwright export | Generate `.spec.ts` from recordings |
-| Ignore dynamic regions | Mask with magenta pixels in visual regression |
-| Custom assertions | LLM generates JS code, evaluates in page context |
-| Step failure handling | Per-step: abort, skip, or retry (configured in plan) |
+| Decision | Choice | Confirmed |
+|---|---|---|
+| Planning strategy | Hybrid: generate full plan upfront, adapt step-by-step during execution | Yes |
+| Preconditions | Planner generates setup steps (e.g., login) as part of the plan | Yes |
+| Negative test cases | No auto-generation for v1. User requests explicitly if wanted | Yes |
+| Max steps per plan | 20 steps max. Longer flows split into sequenced sub-plans | Yes |
+| LLM tier for planning | Balanced (Sonnet) for plan generation, Fast (Haiku) for element finding | — |
+| Screenshots | Opt-in (off by default), stored in separate directory | Yes |
+| Assertions | Per-plan configurable: each step sets onFailure (abort/skip/retry) | Yes |
+| Parameters | Auto-detect during recording (email, password, username, numbers) | Yes |
+| File naming | `{name-slugified}-{short-id}.json` | Yes |
+| Full HTML snapshots | No — too heavy. Simplified DOM is sufficient | Yes |
+| Visual baselines | Auto-capture on first run (Jest snapshot style) | Yes |
+| Playwright export | Generate `.spec.ts` from recordings | Yes |
+| Ignore dynamic regions | Mask with magenta pixels in visual regression | — |
+| Custom assertions | LLM generates JS code, evaluates in page context | Yes |
 
 ---
 
@@ -32,7 +34,7 @@ Build the Planner agent that turns high-level test goals into step-by-step plans
 
 Takes a natural language goal + sitemap and produces a test plan, then executes it step-by-step with recording.
 
-- `planTest(goal, sitemap)` — LLM generates full plan with steps, assertions, parameters, preconditions
+- `planTest(goal, sitemap)` — LLM generates full plan with steps, assertions, parameters, preconditions. Auto-splits into sub-plans if >20 steps
 - `refinePlan(plan, feedback)` — LLM adjusts plan based on execution feedback
 - `executePlan(plan, options?)` — Collaborative execution loop:
   1. For each step: navigate if needed → find element via LLM → execute action → verify assertions
