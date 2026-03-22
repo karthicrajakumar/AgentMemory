@@ -58,6 +58,35 @@ export type { DeepExploreOptions, DeepExploreResult, VerificationResult } from '
 export { Orchestrator } from './agents/orchestrator.js';
 export type { ExploreAppOptions, ExploreAppResult } from './agents/orchestrator.js';
 
+// Phase 3: Planner, Recording, Assertions
+
+export { PlannerAgent } from './agents/planner.js';
+export type {
+  TestPlan,
+  TestStep,
+  PlannedAssertion,
+  ExecutionResult,
+  PlannerOptions,
+} from './agents/planner.js';
+
+export { RecordingManager } from './state/recordings.js';
+export type {
+  Recording,
+  ActionRecord,
+  AssertionRecord,
+  AssertionResult,
+  ParameterDef,
+  ActionType,
+  RecordingMetadata,
+  RecordingSummary,
+} from './state/recordings.js';
+
+export { ElementAssertionEngine } from './assertions/element.js';
+export { VisualAssertionEngine } from './assertions/visual.js';
+export type { VisualDiff, CompareOptions, BoundingBox } from './assertions/visual.js';
+export { CustomAssertionEngine } from './assertions/custom.js';
+export type { CustomAssertionFn } from './assertions/custom.js';
+
 // Shared types
 
 export type {
