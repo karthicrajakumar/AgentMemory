@@ -17,6 +17,12 @@ export interface AgentBudget {
   maxTimeMs?: number;
 }
 
+export interface Credentials {
+  username?: string;
+  email?: string;
+  password: string;
+}
+
 export interface AgentContext {
   browser: BrowserController;
   observer: PageObserver;
@@ -24,6 +30,7 @@ export interface AgentContext {
   llm: LLMClient;
   pageState: PageStateManager;
   sitemap: SiteMapManager;
+  credentials?: Credentials;
 }
 
 export abstract class BaseAgent {
@@ -32,6 +39,7 @@ export abstract class BaseAgent {
 
   protected context: AgentContext;
   protected budget: AgentBudget;
+  protected startTime = 0;
   private messageHandlers: Array<(message: AgentMessage) => Promise<AgentMessage>> = [];
 
   constructor(context: AgentContext, budget?: AgentBudget) {
@@ -77,6 +85,14 @@ export abstract class BaseAgent {
     }
   }
 
+  protected checkBudget(): void {
+    if (this.budget.maxTimeMs && this.startTime > 0) {
+      if (Date.now() - this.startTime > this.budget.maxTimeMs) {
+        throw new AgentBudgetExceededError(`${this.name} exceeded time budget of ${this.budget.maxTimeMs}ms`);
+      }
+    }
+  }
+
   protected async withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
     try {
       return await fn();
@@ -96,5 +112,12 @@ export class AgentAbortError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AgentAbortError';
+  }
+}
+
+export class AgentBudgetExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgentBudgetExceededError';
   }
 }

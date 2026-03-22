@@ -1,9 +1,10 @@
 import { BaseAgent, type AgentContext, type AgentBudget } from './types.js';
-import type { SiteMapPage, SiteMapEdge } from '../state/sitemap.js';
+import type { SiteMapPage } from '../state/sitemap.js';
 import type { LinkElement, FormField, InteractiveElement } from '../types/index.js';
 import type { LLMResponse } from '../llm/interface.js';
 import { writeFile, mkdir } from 'fs/promises';
 import { dirname } from 'path';
+import { createHash } from 'crypto';
 
 export interface ScoutOptions {
   maxPages?: number;
@@ -29,6 +30,7 @@ export interface ScoutPageResult {
   pageType: string;
   description: string;
   screenshotPath: string;
+  sharedComponentIds: string[];
 }
 
 const DEFAULT_SCOUT_OPTIONS: Required<Omit<ScoutOptions, 'signal'>> = {
@@ -50,6 +52,7 @@ export class ScoutAgent extends BaseAgent {
   private visitedFingerprints = new Set<string>();
   private frontier: Array<{ url: string; depth: number }> = [];
   private entryDomain = '';
+  private regionFingerprints = new Map<string, { count: number; selector: string; tag: string }>();
 
   constructor(context: AgentContext, budget?: AgentBudget) {
     super(context, budget ?? { maxTokens: 50_000, maxTimeMs: 300_000 });
@@ -57,19 +60,21 @@ export class ScoutAgent extends BaseAgent {
 
   async scoutApp(entryUrl: string, options?: ScoutOptions): Promise<void> {
     const opts = { ...DEFAULT_SCOUT_OPTIONS, ...options };
-    const startTime = Date.now();
+    this.startTime = Date.now();
 
     this.entryDomain = new URL(entryUrl).hostname;
     this.frontier = [{ url: entryUrl, depth: 0 }];
     this.visitedUrls.clear();
     this.visitedFingerprints.clear();
+    this.regionFingerprints.clear();
 
     while (this.frontier.length > 0) {
       this.checkAborted(opts.signal);
+      this.checkBudget();
 
       // Check limits
       if (this.visitedUrls.size >= opts.maxPages) break;
-      if (Date.now() - startTime > opts.timeout) break;
+      if (Date.now() - this.startTime > opts.timeout) break;
 
       const next = this.frontier.shift()!;
       if (this.visitedUrls.has(next.url)) continue;
@@ -134,14 +139,14 @@ export class ScoutAgent extends BaseAgent {
     await this.context.browser.waitForNavigation().catch(() => {});
 
     const page = this.context.browser.currentPage();
-    const actualUrl = page.url();
+    let actualUrl = page.url();
 
     // Mark as visited
     this.visitedUrls.add(url);
     this.visitedUrls.add(actualUrl); // Also mark redirected URL
 
     // Observe page
-    const observation = await this.context.observer.observe(page);
+    let observation = await this.context.observer.observe(page);
 
     // Check fingerprint dedup
     if (this.visitedFingerprints.has(observation.fingerprint)) {
@@ -156,9 +161,24 @@ export class ScoutAgent extends BaseAgent {
         pageType: 'duplicate',
         description: 'Duplicate page (same fingerprint as previously visited page)',
         screenshotPath: '',
+        sharedComponentIds: [],
       };
     }
     this.visitedFingerprints.add(observation.fingerprint);
+
+    // Use LLM to classify page
+    const classification = await this.classifyPage(observation);
+
+    // Auto-login if this is a login page and credentials are provided
+    if (classification.authType === 'login_form' && this.context.credentials) {
+      const loginResult = await this.attemptLogin(observation);
+      if (loginResult) {
+        // Re-observe the page after login
+        observation = await this.context.observer.observe(page);
+        actualUrl = page.url();
+        this.visitedUrls.add(actualUrl);
+      }
+    }
 
     // Save screenshot
     let screenshotPath = '';
@@ -173,8 +193,8 @@ export class ScoutAgent extends BaseAgent {
       }
     }
 
-    // Use LLM to classify page
-    const classification = await this.classifyPage(observation);
+    // Detect shared components (DOM regions that repeat across pages)
+    const sharedComponentIds = await this.detectSharedComponents(observation);
 
     // Update page state
     this.context.pageState.setCurrentPage({
@@ -195,6 +215,7 @@ export class ScoutAgent extends BaseAgent {
       pageType: classification.pageType,
       description: classification.description,
       screenshotPath,
+      sharedComponentIds,
     };
   }
 
@@ -221,6 +242,153 @@ export class ScoutAgent extends BaseAgent {
 
   getFrontierSize(): number {
     return this.frontier.length;
+  }
+
+  private async attemptLogin(observation: {
+    forms: FormField[];
+  }): Promise<boolean> {
+    const creds = this.context.credentials!;
+    const page = this.context.browser.currentPage();
+
+    try {
+      // Find username/email field
+      const usernameField = observation.forms.find(
+        (f) =>
+          f.type === 'email' ||
+          f.type === 'text' &&
+            (f.name?.includes('email') ||
+              f.name?.includes('user') ||
+              f.label?.toLowerCase().includes('email') ||
+              f.label?.toLowerCase().includes('username') ||
+              f.placeholder?.toLowerCase().includes('email') ||
+              f.placeholder?.toLowerCase().includes('username')),
+      );
+
+      // Find password field
+      const passwordField = observation.forms.find((f) => f.type === 'password');
+
+      if (!passwordField) {
+        console.warn('[scout] Login form detected but no password field found');
+        return false;
+      }
+
+      // Fill username/email
+      if (usernameField?.selector) {
+        const value = creds.email ?? creds.username ?? '';
+        if (value) {
+          await page.locator(usernameField.selector).fill(value);
+        }
+      }
+
+      // Fill password
+      if (passwordField.selector) {
+        await page.locator(passwordField.selector).fill(creds.password);
+      }
+
+      // Find and click submit button
+      const submitButton = await page.locator(
+        'button[type="submit"], input[type="submit"], button:has-text("Log in"), button:has-text("Sign in"), button:has-text("Login")',
+      ).first();
+
+      await submitButton.click();
+
+      // Wait for navigation after login
+      await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+
+      console.log(`[scout] Auto-login attempted, now at ${page.url()}`);
+      return true;
+    } catch (err) {
+      console.warn('[scout] Auto-login failed:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Detect repeated DOM regions across pages (nav, header, footer, sidebar).
+   * Uses fingerprinting of top-level semantic regions to identify shared components.
+   */
+  private async detectSharedComponents(observation: {
+    url: string;
+    links: LinkElement[];
+    interactiveElements: InteractiveElement[];
+  }): Promise<string[]> {
+    const page = this.context.browser.currentPage();
+    const sharedIds: string[] = [];
+
+    try {
+      // Extract fingerprints for major semantic regions
+      const regions = await page.evaluate(() => {
+        const regionSelectors = ['header', 'nav', 'footer', 'aside', '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]'];
+        const results: Array<{ selector: string; tag: string; html: string }> = [];
+
+        for (const sel of regionSelectors) {
+          const els = document.querySelectorAll(sel);
+          for (const el of els) {
+            // Get outer structure (tag + attributes, children tags) — not content
+            function structureOf(node: Element): string {
+              const tag = node.tagName.toLowerCase();
+              const childTags = Array.from(node.children)
+                .map((c) => structureOf(c))
+                .join(',');
+              return childTags ? `${tag}(${childTags})` : tag;
+            }
+            results.push({
+              selector: sel,
+              tag: el.tagName.toLowerCase(),
+              html: structureOf(el),
+            });
+          }
+        }
+
+        return results;
+      });
+
+      for (const region of regions) {
+        const fingerprint = createHash('sha256')
+          .update(region.html)
+          .digest('hex')
+          .slice(0, 16);
+
+        // Check if we already know this shared component
+        const existing = this.context.sitemap.getSharedComponentByFingerprint(fingerprint);
+        if (existing) {
+          sharedIds.push(existing.id);
+          continue;
+        }
+
+        // Track how many pages we've seen this region on
+        if (!this.regionFingerprints.has(fingerprint)) {
+          this.regionFingerprints.set(fingerprint, { count: 1, selector: region.selector, tag: region.tag });
+        } else {
+          const entry = this.regionFingerprints.get(fingerprint)!;
+          entry.count += 1;
+
+          // Seen on 2+ pages → register as shared component
+          if (entry.count === 2) {
+            const id = `shared-${entry.tag}-${fingerprint.slice(0, 8)}`;
+            const relevantLinks = observation.links.filter(() => true); // All links for now
+            const relevantElements = observation.interactiveElements.filter(() => true);
+
+            this.context.sitemap.addSharedComponent({
+              id,
+              name: `${entry.tag} (${entry.selector})`,
+              fingerprint,
+              selector: entry.selector,
+              description: `Shared ${entry.tag} component detected across multiple pages`,
+              interactiveElements: relevantElements.slice(0, 20), // Cap for sanity
+              links: relevantLinks.slice(0, 30),
+              analyzedAt: new Date().toISOString(),
+            });
+
+            sharedIds.push(id);
+          }
+        }
+      }
+    } catch {
+      // Non-critical — shared component detection is best-effort
+    }
+
+    return sharedIds;
   }
 
   private async classifyPage(observation: {

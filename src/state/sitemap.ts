@@ -78,10 +78,22 @@ export interface SiteMapEdge {
   selector?: string;
 }
 
+export interface SharedComponent {
+  id: string;
+  name: string; // e.g., "main-nav", "footer"
+  fingerprint: string; // DOM subtree fingerprint
+  selector: string; // CSS selector for the region
+  description: string;
+  interactiveElements: InteractiveElement[];
+  links: LinkElement[];
+  analyzedAt: string;
+}
+
 export interface SiteMap {
   entryUrl: string;
   pages: Map<string, SiteMapPage>;
   edges: SiteMapEdge[];
+  sharedComponents: Map<string, SharedComponent>;
   createdAt: string;
   updatedAt: string;
 }
@@ -90,6 +102,7 @@ interface SerializedSiteMap {
   entryUrl: string;
   pages: Record<string, SiteMapPage>;
   edges: SiteMapEdge[];
+  sharedComponents: Record<string, SharedComponent>;
   createdAt: string;
   updatedAt: string;
 }
@@ -106,6 +119,7 @@ export class SiteMapManager {
       entryUrl,
       pages: new Map(),
       edges: [],
+      sharedComponents: new Map(),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -218,6 +232,33 @@ export class SiteMapManager {
     return this.sitemap.pages.get(url)?.virtualPages ?? [];
   }
 
+  // Shared components
+
+  addSharedComponent(component: SharedComponent): void {
+    this.sitemap.sharedComponents.set(component.id, component);
+    this.sitemap.updatedAt = new Date().toISOString();
+    this.persistAsync();
+  }
+
+  getSharedComponent(id: string): SharedComponent | null {
+    return this.sitemap.sharedComponents.get(id) ?? null;
+  }
+
+  getSharedComponentByFingerprint(fingerprint: string): SharedComponent | null {
+    for (const comp of this.sitemap.sharedComponents.values()) {
+      if (comp.fingerprint === fingerprint) return comp;
+    }
+    return null;
+  }
+
+  getAllSharedComponents(): SharedComponent[] {
+    return [...this.sitemap.sharedComponents.values()];
+  }
+
+  isSharedComponent(fingerprint: string): boolean {
+    return this.getSharedComponentByFingerprint(fingerprint) !== null;
+  }
+
   // Persistence
 
   async save(path?: string): Promise<void> {
@@ -229,6 +270,7 @@ export class SiteMapManager {
       entryUrl: this.sitemap.entryUrl,
       pages: Object.fromEntries(this.sitemap.pages),
       edges: this.sitemap.edges,
+      sharedComponents: Object.fromEntries(this.sitemap.sharedComponents),
       createdAt: this.sitemap.createdAt,
       updatedAt: this.sitemap.updatedAt,
     };
@@ -246,6 +288,7 @@ export class SiteMapManager {
         entryUrl: data.entryUrl,
         pages: new Map(Object.entries(data.pages)),
         edges: data.edges,
+        sharedComponents: new Map(Object.entries(data.sharedComponents ?? {})),
         createdAt: data.createdAt,
         updatedAt: data.updatedAt,
       };
@@ -266,6 +309,13 @@ export class SiteMapManager {
     // Union of edges
     for (const edge of other.edges) {
       this.addEdge(edge);
+    }
+
+    // Union of shared components
+    for (const [id, comp] of other.sharedComponents) {
+      if (!this.sitemap.sharedComponents.has(id)) {
+        this.sitemap.sharedComponents.set(id, comp);
+      }
     }
 
     this.sitemap.updatedAt = new Date().toISOString();

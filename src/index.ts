@@ -31,6 +31,35 @@ export type {
 export { PageStateManager } from './state/page-state.js';
 export type { PageState, PageKnowledge } from './state/page-state.js';
 
+export { SiteMapManager } from './state/sitemap.js';
+export type {
+  SiteMapPage,
+  SiteMapEdge,
+  SiteMap,
+  SharedComponent,
+  DeepPageAnalysis,
+  InteractionMapEntry,
+  FormAnalysis,
+  FormFieldAnalysis,
+  DynamicRegion,
+} from './state/sitemap.js';
+
+// Phase 2: Agents — Scout, Deep Explorer, Orchestrator
+
+export { BaseAgent, AgentAbortError, AgentBudgetExceededError } from './agents/types.js';
+export type { AgentContext, AgentBudget, AgentMessage, Credentials } from './agents/types.js';
+
+export { ScoutAgent } from './agents/scout.js';
+export type { ScoutOptions, ScoutPageResult } from './agents/scout.js';
+
+export { DeepExplorerAgent } from './agents/deep-explorer.js';
+export type { DeepExploreOptions, DeepExploreResult, VerificationResult } from './agents/deep-explorer.js';
+
+export { Orchestrator } from './agents/orchestrator.js';
+export type { ExploreAppOptions, ExploreAppResult } from './agents/orchestrator.js';
+
+// Shared types
+
 export type {
   InteractiveElement,
   FormField,

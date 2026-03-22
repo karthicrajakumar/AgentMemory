@@ -1,11 +1,32 @@
 # Phase 2: Scout & Explorer
 
-> Status: APPROVED — decisions locked in
+> Status: IMPLEMENTED
 > Depends on: Phase 1 (Foundation)
 
 ## Goal
 
 Build the Explorer agent with its two sub-agents — Scout (fast BFS discovery) and Deep Explorer (detailed page analysis). By the end of this phase, Replaybot can autonomously map an application and build a rich understanding of each page.
+
+## Design Decisions
+
+| Decision | Choice |
+|---|---|
+| Agent communication | Direct method calls — no message bus |
+| Scout scope | Links only (`<a>` tags) |
+| Deep Explorer interaction | Observe + selective verify |
+| Resumability | Persist frontier/state to disk |
+| Error handling | Retry once, skip on failure |
+| Per-agent budget | Scout: 50k tokens/5min, Deep Explorer: 100k tokens/10min |
+| Auth handling | Accept credentials upfront, auto-login when login form detected |
+| Deep analysis storage | Alongside sitemap (`deepAnalysis` field on `SiteMapPage`) |
+| Page deduplication | DOM fingerprint dedup |
+| Shared components | Auto-detect repeated DOM regions, deduplicate, analyze once |
+| SPA transitions | Network idle + DOM settle |
+| Page visiting | Sequential (single tab) |
+| Screenshots | Every page Scout visits |
+| LLM tiers | Haiku for Scout, Sonnet for Deep Explorer |
+
+---
 
 ## Deliverables
 
@@ -13,191 +34,96 @@ Build the Explorer agent with its two sub-agents — Scout (fast BFS discovery) 
 
 Shared interfaces and base behavior for all agents.
 
-```typescript
-interface Agent {
-  name: string;
-  role: string;
-
-  // Every agent is page-aware
-  getCurrentPage(): PageState;
-  getTargetPage(): string | null;
-
-  // Communication between agents
-  sendMessage(to: Agent, message: AgentMessage): Promise<AgentMessage>;
-  onMessage(handler: (message: AgentMessage) => Promise<AgentMessage>): void;
-}
-
-interface AgentMessage {
-  from: string;
-  type: 'request' | 'response' | 'status' | 'auth_required';
-  content: any;
-  timestamp: string;
-}
-
-// Agent execution context — shared resources
-interface AgentContext {
-  browser: BrowserController;
-  observer: PageObserver;
-  actions: ActionExecutor;
-  llm: LLMClient;
-  pageState: PageStateManager;
-  sitemap: SiteMapManager;
-  config: ReplaybotConfig;
-}
-```
-
-**Decisions**:
-- **Direct method calls** for agent communication — no message bus. Scout/Deep Explorer are called directly by the orchestrator. Simple, debuggable, no over-engineering.
-- **Cancellable via AbortSignal** — agents accept `AbortSignal` and check it between operations. Caller can abort at any time.
-- **Retry once, then surface error** — agents retry a failed action once. If it fails again, they log the error and skip that item (don't block the whole exploration).
-- **Budget per invocation** — `maxTokens` and `maxTimeMs` on every agent call. Defaults: Scout 50k tokens/5min, Deep Explorer 100k tokens/10min per page.
-
----
+- **BaseAgent** — abstract base with `name`, `role`, `context`, `budget`
+- **AgentContext** — shared resources (browser, observer, actions, llm, pageState, sitemap, credentials)
+- **AgentBudget** — `maxTokens` + `maxTimeMs` per invocation
+- **Credentials** — optional `username`/`email`/`password` for auto-login
+- **AgentAbortError** / **AgentBudgetExceededError** — typed errors
+- Built-in `checkAborted()`, `checkBudget()`, `withRetry()` helpers
 
 ### 2.2 Scout Agent (`src/agents/scout.ts`)
 
-Fast, breadth-first page discovery using a cheap/fast model (Haiku-class).
+Fast, breadth-first page discovery using Haiku-tier LLM.
 
-```typescript
-interface ScoutAgent extends Agent {
-  scoutApp(entryUrl: string, options?: ScoutOptions): Promise<SiteMap>;
-  scoutPage(url: string): Promise<ScoutPageResult>;
-  expandFrontier(): Promise<ScoutPageResult[]>;
-}
-
-interface ScoutOptions {
-  maxPages: number;            // Default: 50
-  maxDepth: number;            // Default: 5
-  stayWithinDomain: boolean;   // Default: true
-  excludePatterns: string[];
-  includePatterns: string[];
-  timeout: number;             // Default: 300000 (5min)
-  signal?: AbortSignal;
-}
-
-interface ScoutPageResult {
-  url: string;
-  title: string;
-  fingerprint: string;
-  linksFound: LinkElement[];
-  formsFound: FormField[];
-  interactiveElements: InteractiveElement[];
-  isAuthGated: boolean;
-  authType?: 'login_form' | 'oauth_redirect' | 'basic_auth' | 'unknown';
-  pageType: string;
-  description: string;
-  screenshotPath: string;
-}
-```
-
-**Decisions**:
-- **Links only for v1** — Scout follows `<a>` links only, no button clicks or dropdown interactions. Keeps it fast and predictable.
-- **Skip infinite scroll** — don't try to trigger lazy loading. Deep Explorer handles dynamic content later.
-- **Fingerprint dedup** — compare page fingerprints to skip duplicate pages with different URLs (common in SPAs with query params). If fingerprint matches a known page, skip it.
-- **500ms delay between visits** — polite crawling, configurable via options.
-- **No network sniffing** — skip API endpoint detection for v1.
-
----
+- `scoutApp(entryUrl, options?)` — full BFS exploration
+- `scoutPage(url, options?)` — single page scout
+- `expandFrontier()` — process next batch of frontier items
+- **Auto-login** — when credentials provided and login form detected, fills email/username + password and submits
+- **Shared component detection** — fingerprints semantic regions (header, nav, footer, aside) across pages. When same structure seen on 2+ pages, registers as SharedComponent in sitemap
+- **Fingerprint dedup** — skips pages with identical DOM structure
+- **Configurable** — maxPages, maxDepth, stayWithinDomain, include/exclude patterns, delay between pages
 
 ### 2.3 Deep Explorer Agent (`src/agents/deep-explorer.ts`)
 
-Thorough analysis of a specific page or flow using a capable model.
+Thorough analysis of individual pages using Sonnet-tier LLM.
 
-```typescript
-interface DeepExplorerAgent extends Agent {
-  explorePage(url: string): Promise<DeepPageAnalysis>;
-  exploreFlow(startUrl: string, flowDescription: string): Promise<FlowAnalysis>;
-  exploreElement(selector: SelectorChain): Promise<ElementAnalysis>;
-}
-```
+- `explorePage(url, options?)` — deep analysis of a single page
+- **Phase 1: Observe** — LLM analyzes simplified DOM and predicts interaction outcomes for every element
+- **Phase 2: Selective verify** — for low/medium confidence predictions, actually clicks the element and compares outcome to prediction
+- **Shared component skip** — skips analysis of DOM regions already analyzed as shared components
+- **Produces**: `DeepPageAnalysis` with interaction map, form analyses, dynamic regions, suggested test scenarios
+- **Budget-aware** — checks abort signal and time budget between operations
 
-**Decisions**:
-- **Option C: Observe first, selectively verify** — Deep Explorer observes the page and predicts outcomes. For high-confidence predictions (e.g., "this link navigates to /about"), no verification. For low-confidence or complex interactions (e.g., "form submission triggers X"), it verifies by actually performing the action.
-- **Generate selectors at analysis time** — Deep Explorer produces `SelectorChain` for every element it analyzes, so downstream agents have ready-to-use selectors.
-- **Skip precondition-dependent pages** — if a page requires specific state (items in cart, etc.), Deep Explorer notes the precondition but doesn't attempt to set it up. That's the Planner's job in Phase 3.
-- **No performance observations** — skip timing/animation analysis for v1.
+### 2.4 Orchestrator (`src/agents/orchestrator.ts`)
 
----
+Coordinates Scout → Deep Explorer flow.
 
-### 2.4 Explorer Orchestrator (`src/agents/explorer.ts`)
+- `exploreApp(options)` — full exploration: Scout all pages, then Deep Explore selected pages
+- `resumeExploration(options)` — load persisted state and continue
+- **Page selection strategies**: `all`, `forms-and-interactive` (default), `forms-only`, `none`
+- **Priority-based selection** — pages with forms get highest priority, then interactive pages
+- **Callbacks** — `onPageScouted`, `onPageExplored`, `onStatus` for progress tracking
+- **Error collection** — captures per-page errors without stopping exploration
 
-Coordinates Scout and Deep Explorer.
+### 2.5 Sitemap with Shared Components (`src/state/sitemap.ts`)
 
-```typescript
-interface ExplorerAgent extends Agent {
-  explore(entryUrl: string, options?: ExploreOptions): Promise<ExplorationResult>;
-  exploreArea(urls: string[], depth: 'scout' | 'deep'): Promise<ExplorationResult>;
-  getSiteMap(): SiteMap;
-  getPageAnalysis(url: string): DeepPageAnalysis | null;
-}
+Extended sitemap with shared component tracking.
 
-interface ExploreOptions extends ScoutOptions {
-  deepExplorePages: 'all' | 'forms_only' | 'interactive_only' | 'none';
-  deepExploreLimit: number;    // Default: 10
-  prioritize: 'forms' | 'navigation' | 'breadth';
-  signal?: AbortSignal;
-}
-```
-
-**Decisions**:
-- **Resumable** — exploration state (frontier, visited set, partial sitemap) persisted to disk. `explore()` checks for existing state and resumes.
-- **Auth gates: pause and return** — when Scout hits an auth-gated page, the orchestrator pauses exploration of that branch and includes `auth_required` in the result. The caller (MCP layer in Phase 5) can provide credentials and resume.
-- **Sequential, not concurrent** — Scout completes first, then Deep Explorer runs on prioritized pages. No parallel execution for v1 (simpler, avoids browser context conflicts).
+- **SharedComponent** — `id`, `name`, `fingerprint`, `selector`, `description`, `interactiveElements`, `links`, `analyzedAt`
+- `addSharedComponent()` / `getSharedComponent()` / `getSharedComponentByFingerprint()`
+- `getAllSharedComponents()` / `isSharedComponent()`
+- Shared components serialized alongside sitemap in `.replaybot/sitemap.json`
+- Merge supports shared components (union strategy)
 
 ---
 
-### 2.5 Sitemap Persistence (`src/state/sitemap.ts`)
+## File Structure
 
-Store and retrieve the navigation graph.
-
-```typescript
-interface SiteMapManager {
-  getSiteMap(): SiteMap;
-  addPage(page: SiteMapPage): void;
-  addEdge(edge: SiteMapEdge): void;
-  updatePage(url: string, updates: Partial<SiteMapPage>): void;
-
-  getPage(url: string): SiteMapPage | null;
-  findPath(from: string, to: string): SiteMapEdge[];
-  getUnvisitedPages(): string[];
-  getAuthGatedPages(): SiteMapPage[];
-
-  save(path?: string): Promise<void>;
-  load(path?: string): Promise<void>;
-  merge(other: SiteMap): void;
-
-  addVirtualPage(parentUrl: string, virtualPage: VirtualPage): void;
-  getVirtualPages(url: string): VirtualPage[];
-}
 ```
+src/agents/
+├── types.ts           # BaseAgent, AgentContext, AgentBudget, Credentials
+├── scout.ts           # ScoutAgent (BFS discovery + auto-login + shared component detection)
+├── deep-explorer.ts   # DeepExplorerAgent (observe + selective verify)
+└── orchestrator.ts    # Orchestrator (Scout → Deep Explorer coordination)
 
-**Decisions**:
-- **Auto-save on every mutation** — same pattern as PageStateManager (fire-and-forget persist).
-- **Deep analysis stored alongside sitemap** — `SiteMapPage` includes an optional `deepAnalysis` field. Single source of truth.
-- **Merge: union with newer-wins** — when merging two sitemaps, take the union of all pages/edges. If both have analysis for the same page, keep the one with the more recent `lastVisited` timestamp.
+src/state/
+├── page-state.ts      # PageStateManager (Phase 1)
+└── sitemap.ts         # SiteMapManager + SharedComponent support
+```
 
 ---
 
-## Testing Strategy (Phase 2)
+## Testing Strategy
 
 - **Scout tests**: Against a local multi-page test site (served by a test fixture)
-  - Verifies BFS traversal order
-  - Verifies auth gate detection
-  - Verifies URL filtering (include/exclude patterns)
+  - BFS traversal order, auth gate detection, URL filtering, auto-login, shared component detection
 - **Deep Explorer tests**: Against specific test pages with known forms/elements
-  - Verifies form field detection
-  - Verifies selector chain generation
+  - Form field analysis, interaction mapping, selective verification, shared component skipping
   - Uses mock LLM to verify prompt construction
-- **Explorer orchestrator tests**: Integration test with Scout + Deep Explorer
-  - Verifies correct prioritization
-  - Verifies sitemap completeness
-- **Sitemap tests**: Pure unit tests for graph operations, persistence, merging
+- **Orchestrator tests**: Integration test with Scout + Deep Explorer
+  - Page selection strategies, resume from persisted state, error handling
+- **Sitemap tests**: Shared component CRUD, persistence, merge
 
 ## Phase 2 Exit Criteria
 
-- [ ] Scout can BFS-explore a multi-page site and build a sitemap
-- [ ] Scout detects auth-gated pages and reports them
-- [ ] Deep Explorer produces rich page analysis with selector chains
-- [ ] Explorer orchestrates Scout → Deep flow correctly
-- [ ] Sitemap persists to `.replaybot/sitemap.json` and reloads
+- [x] Scout can BFS-explore a multi-page site and build a sitemap
+- [x] Scout detects auth-gated pages and auto-logs in with provided credentials
+- [x] Scout detects and deduplicates shared components (nav, header, footer)
+- [x] Deep Explorer produces rich page analysis with interaction maps
+- [x] Deep Explorer selectively verifies low-confidence predictions
+- [x] Deep Explorer skips shared components already analyzed
+- [x] Orchestrator coordinates Scout → Deep Explorer flow with page prioritization
+- [x] Orchestrator supports resume from persisted state
+- [x] Sitemap persists to `.replaybot/sitemap.json` with shared components
+- [x] TypeScript compiles cleanly
 - [ ] All tests pass with mock LLM (no real API calls in CI)
