@@ -325,7 +325,7 @@ export class ScoutAgent extends BaseAgent {
           const els = document.querySelectorAll(sel);
           for (const el of els) {
             // Get outer structure (tag + attributes, children tags) — not content
-            function structureOf(node: Element): string {
+            const structureOf = (node: Element): string => {
               const tag = node.tagName.toLowerCase();
               const childTags = Array.from(node.children)
                 .map((c) => structureOf(c))

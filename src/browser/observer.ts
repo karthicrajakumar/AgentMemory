@@ -56,16 +56,16 @@ export class PageObserver {
 
       const SKIP_TAGS = new Set(['script', 'style', 'svg', 'noscript', 'link', 'meta']);
 
-      function isHidden(el: Element): boolean {
+      const isHidden = (el: Element): boolean => {
         const style = window.getComputedStyle(el);
         return (
           style.display === 'none' ||
           style.visibility === 'hidden' ||
           el.getAttribute('aria-hidden') === 'true'
         );
-      }
+      };
 
-      function hasSemantic(el: Element): boolean {
+      const hasSemantic = (el: Element): boolean => {
         return !!(
           el.getAttribute('role') ||
           el.getAttribute('aria-label') ||
@@ -73,9 +73,9 @@ export class PageObserver {
           el.getAttribute('data-testid') ||
           el.id
         );
-      }
+      };
 
-      function simplify(node: Node, depth: number): string {
+      const simplify = (node: Node, depth: number): string => {
         if (node.nodeType === Node.TEXT_NODE) {
           const text = node.textContent?.trim();
           return text ? text : '';
@@ -143,7 +143,7 @@ export class PageObserver {
 
   async getPageFingerprint(page: Page): Promise<string> {
     const tagStructure = await page.evaluate(() => {
-      function extractStructure(node: Node): string {
+      const extractStructure = (node: Node): string => {
         if (node.nodeType !== Node.ELEMENT_NODE) return '';
         const el = node as Element;
         const tag = el.tagName.toLowerCase();
