@@ -1,6 +1,6 @@
 # Phase 2: Scout & Explorer
 
-> Status: DRAFT — pending discussion
+> Status: APPROVED — decisions locked in
 > Depends on: Phase 1 (Foundation)
 
 ## Goal
@@ -39,18 +39,18 @@ interface AgentContext {
   browser: BrowserController;
   observer: PageObserver;
   actions: ActionExecutor;
-  llm: LLMProvider;
+  llm: LLMClient;
   pageState: PageStateManager;
   sitemap: SiteMapManager;
   config: ReplaybotConfig;
 }
 ```
 
-**Key decisions to discuss**:
-- Should agents communicate via direct method calls or via a message bus/event system?
-- Should agent execution be cancellable (e.g., user aborts exploration)?
-- How to handle agent errors — retry? escalate to the calling agent?
-- Should there be a max budget (tokens/time) per agent invocation?
+**Decisions**:
+- **Direct method calls** for agent communication — no message bus. Scout/Deep Explorer are called directly by the orchestrator. Simple, debuggable, no over-engineering.
+- **Cancellable via AbortSignal** — agents accept `AbortSignal` and check it between operations. Caller can abort at any time.
+- **Retry once, then surface error** — agents retry a failed action once. If it fails again, they log the error and skip that item (don't block the whole exploration).
+- **Budget per invocation** — `maxTokens` and `maxTimeMs` on every agent call. Defaults: Scout 50k tokens/5min, Deep Explorer 100k tokens/10min per page.
 
 ---
 
@@ -60,21 +60,19 @@ Fast, breadth-first page discovery using a cheap/fast model (Haiku-class).
 
 ```typescript
 interface ScoutAgent extends Agent {
-  // Primary function
   scoutApp(entryUrl: string, options?: ScoutOptions): Promise<SiteMap>;
-
-  // Incremental scouting
   scoutPage(url: string): Promise<ScoutPageResult>;
-  expandFrontier(): Promise<ScoutPageResult[]>;  // Visit next unvisited pages
+  expandFrontier(): Promise<ScoutPageResult[]>;
 }
 
 interface ScoutOptions {
-  maxPages: number;            // Stop after N pages discovered (default: 50)
-  maxDepth: number;            // Max clicks from entry page (default: 5)
-  stayWithinDomain: boolean;   // Don't follow external links (default: true)
-  excludePatterns: string[];   // URL patterns to skip (e.g., '/admin/*')
-  includePatterns: string[];   // Only visit URLs matching these patterns
-  timeout: number;             // Max total time in ms (default: 300000 = 5min)
+  maxPages: number;            // Default: 50
+  maxDepth: number;            // Default: 5
+  stayWithinDomain: boolean;   // Default: true
+  excludePatterns: string[];
+  includePatterns: string[];
+  timeout: number;             // Default: 300000 (5min)
+  signal?: AbortSignal;
 }
 
 interface ScoutPageResult {
@@ -86,32 +84,18 @@ interface ScoutPageResult {
   interactiveElements: InteractiveElement[];
   isAuthGated: boolean;
   authType?: 'login_form' | 'oauth_redirect' | 'basic_auth' | 'unknown';
+  pageType: string;
+  description: string;
   screenshotPath: string;
 }
 ```
 
-**Scout BFS algorithm**:
-1. Visit entry URL → observe page → extract links + interactive elements
-2. Add discovered URLs to frontier queue (BFS order)
-3. For each URL in frontier:
-   - Navigate → observe → extract
-   - If auth-gated: pause, report to caller, await credentials
-   - Record page in sitemap
-   - Add new links to frontier
-4. Continue until maxPages, maxDepth, or timeout reached
-5. Return completed SiteMap
-
-**LLM usage** (Haiku-class, minimal prompts):
-- Classify page type: "login", "form", "listing", "detail", "dashboard", etc.
-- Detect auth gates: "Does this page require authentication?"
-- Generate page description: one-line summary of page purpose
-
-**Key decisions to discuss**:
-- Should Scout interact with pages (click buttons, open dropdowns) or only follow links?
-- How to handle infinite scroll / lazy-loaded content?
-- Should Scout detect and skip duplicate pages (same content, different URL)?
-- Rate limiting between page visits to avoid overwhelming the target app?
-- Should Scout attempt to identify API endpoints from network requests?
+**Decisions**:
+- **Links only for v1** — Scout follows `<a>` links only, no button clicks or dropdown interactions. Keeps it fast and predictable.
+- **Skip infinite scroll** — don't try to trigger lazy loading. Deep Explorer handles dynamic content later.
+- **Fingerprint dedup** — compare page fingerprints to skip duplicate pages with different URLs (common in SPAs with query params). If fingerprint matches a known page, skip it.
+- **500ms delay between visits** — polite crawling, configurable via options.
+- **No network sniffing** — skip API endpoint detection for v1.
 
 ---
 
@@ -121,124 +105,44 @@ Thorough analysis of a specific page or flow using a capable model.
 
 ```typescript
 interface DeepExplorerAgent extends Agent {
-  // Explore a single page in depth
   explorePage(url: string): Promise<DeepPageAnalysis>;
-
-  // Explore a multi-step flow (e.g., "the checkout process")
   exploreFlow(startUrl: string, flowDescription: string): Promise<FlowAnalysis>;
-
-  // Explore a specific element in detail
   exploreElement(selector: SelectorChain): Promise<ElementAnalysis>;
-}
-
-interface DeepPageAnalysis {
-  url: string;
-  fingerprint: string;
-  pageType: string;              // 'form', 'dashboard', 'listing', etc.
-  purpose: string;               // LLM-generated description
-  interactionMap: InteractionMap; // What can be done on this page
-
-  forms: FormAnalysis[];
-  navigation: NavigationAnalysis;
-  dynamicRegions: DynamicRegion[];  // Parts that change (SPA states)
-  validationRules: ValidationRule[];  // Detected input validation
-
-  suggestedTestScenarios: string[];  // LLM-suggested things to test
-}
-
-interface InteractionMap {
-  actions: Array<{
-    element: InteractiveElement;
-    selectors: SelectorChain;
-    expectedOutcome: string;     // LLM prediction: "opens modal", "submits form"
-    sideEffects: string[];       // "sends email", "creates account"
-    stateChanges: string[];      // "shows success message", "navigates to /dashboard"
-  }>;
-}
-
-interface FormAnalysis {
-  selector: SelectorChain;
-  purpose: string;               // "user registration", "search", "contact"
-  fields: Array<{
-    name: string;
-    type: string;                // 'email', 'password', 'text', 'select', etc.
-    required: boolean;
-    validationRules: string[];   // "min 8 chars", "must contain number"
-    selectors: SelectorChain;
-    suggestedTestValues: {
-      valid: string;
-      invalid: string[];         // Edge cases to test
-    };
-  }>;
-  submitButton: SelectorChain;
-  expectedSuccessIndicator: string;  // What signals successful submission
-  expectedErrorIndicator: string;
-}
-
-interface DynamicRegion {
-  description: string;
-  triggerAction: string;         // "click tab", "scroll down"
-  triggerSelector: SelectorChain;
-  resultFingerprint: string;     // DOM fingerprint of the resulting state
 }
 ```
 
-**LLM usage** (Sonnet/Opus-class, rich prompts with screenshots + a11y tree + DOM):
-- Full page semantic analysis
-- Form field purpose detection and test value generation
-- Interaction outcome prediction
-- Validation rule detection
-- Test scenario suggestion
-
-**Key decisions to discuss**:
-- How much should Deep Explorer actually interact with the page vs. just observe?
-  - Option A: Observe only, predict outcomes
-  - Option B: Actually click/type to verify predictions, then undo/reset
-  - Option C: Observe first, then selectively verify high-uncertainty predictions
-- Should it generate selector chains at analysis time, or defer to action time?
-- How to handle pages that require specific preconditions (e.g., items in cart)?
-- Should the analysis include performance observations (slow loads, animations)?
+**Decisions**:
+- **Option C: Observe first, selectively verify** — Deep Explorer observes the page and predicts outcomes. For high-confidence predictions (e.g., "this link navigates to /about"), no verification. For low-confidence or complex interactions (e.g., "form submission triggers X"), it verifies by actually performing the action.
+- **Generate selectors at analysis time** — Deep Explorer produces `SelectorChain` for every element it analyzes, so downstream agents have ready-to-use selectors.
+- **Skip precondition-dependent pages** — if a page requires specific state (items in cart, etc.), Deep Explorer notes the precondition but doesn't attempt to set it up. That's the Planner's job in Phase 3.
+- **No performance observations** — skip timing/animation analysis for v1.
 
 ---
 
 ### 2.4 Explorer Orchestrator (`src/agents/explorer.ts`)
 
-Coordinates Scout and Deep Explorer. Decides when to scout broadly vs. go deep.
+Coordinates Scout and Deep Explorer.
 
 ```typescript
 interface ExplorerAgent extends Agent {
-  // Full exploration
   explore(entryUrl: string, options?: ExploreOptions): Promise<ExplorationResult>;
-
-  // Targeted exploration
   exploreArea(urls: string[], depth: 'scout' | 'deep'): Promise<ExplorationResult>;
-
-  // Get current knowledge
   getSiteMap(): SiteMap;
   getPageAnalysis(url: string): DeepPageAnalysis | null;
 }
 
 interface ExploreOptions extends ScoutOptions {
   deepExplorePages: 'all' | 'forms_only' | 'interactive_only' | 'none';
-  deepExploreLimit: number;    // Max pages to deep-explore (default: 10)
-  prioritize: 'forms' | 'navigation' | 'breadth';  // What to deep-explore first
+  deepExploreLimit: number;    // Default: 10
+  prioritize: 'forms' | 'navigation' | 'breadth';
+  signal?: AbortSignal;
 }
 ```
 
-**Orchestration flow**:
-1. Run Scout to build initial sitemap
-2. Analyze sitemap to prioritize pages for deep exploration
-   - Forms and interactive pages get highest priority
-   - Auth-gated pages flagged for credential handling
-3. Run Deep Explorer on prioritized pages
-4. Update sitemap with deep knowledge
-5. If Scout discovered new pages during deep exploration, loop back
-
-**Key decisions to discuss**:
-- Should exploration be resumable (e.g., stop and continue later)?
-- How to handle the credential prompt flow when Scout hits auth gates?
-  - MCP response with `auth_required` type? Wait for next tool call with credentials?
-- Should the orchestrator run Scout and Deep Explorer concurrently on different pages?
+**Decisions**:
+- **Resumable** — exploration state (frontier, visited set, partial sitemap) persisted to disk. `explore()` checks for existing state and resumes.
+- **Auth gates: pause and return** — when Scout hits an auth-gated page, the orchestrator pauses exploration of that branch and includes `auth_required` in the result. The caller (MCP layer in Phase 5) can provide credentials and resume.
+- **Sequential, not concurrent** — Scout completes first, then Deep Explorer runs on prioritized pages. No parallel execution for v1 (simpler, avoids browser context conflicts).
 
 ---
 
@@ -248,33 +152,29 @@ Store and retrieve the navigation graph.
 
 ```typescript
 interface SiteMapManager {
-  // CRUD
   getSiteMap(): SiteMap;
   addPage(page: SiteMapPage): void;
   addEdge(edge: SiteMapEdge): void;
   updatePage(url: string, updates: Partial<SiteMapPage>): void;
 
-  // Querying
   getPage(url: string): SiteMapPage | null;
-  findPath(from: string, to: string): SiteMapEdge[];  // Shortest path
+  findPath(from: string, to: string): SiteMapEdge[];
   getUnvisitedPages(): string[];
   getAuthGatedPages(): SiteMapPage[];
 
-  // Persistence
-  save(path: string): Promise<void>;   // Save to .replaybot/sitemap.json
-  load(path: string): Promise<void>;   // Load from disk
-  merge(other: SiteMap): void;         // Merge with another sitemap (team sharing)
+  save(path?: string): Promise<void>;
+  load(path?: string): Promise<void>;
+  merge(other: SiteMap): void;
 
-  // SPA support
   addVirtualPage(parentUrl: string, virtualPage: VirtualPage): void;
   getVirtualPages(url: string): VirtualPage[];
 }
 ```
 
-**Key decisions to discuss**:
-- Auto-save after every change, or explicit save?
-- Should we store deep analysis alongside the sitemap or separately?
-- Merge strategy when two team members have different sitemaps for the same app?
+**Decisions**:
+- **Auto-save on every mutation** — same pattern as PageStateManager (fire-and-forget persist).
+- **Deep analysis stored alongside sitemap** — `SiteMapPage` includes an optional `deepAnalysis` field. Single source of truth.
+- **Merge: union with newer-wins** — when merging two sitemaps, take the union of all pages/edges. If both have analysis for the same page, keep the one with the more recent `lastVisited` timestamp.
 
 ---
 
