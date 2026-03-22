@@ -1,347 +1,170 @@
 # Phase 4: Execution & Replay
 
-> Status: DRAFT — pending discussion
+> Status: IMPLEMENTED
 > Depends on: Phase 3 (Planner & Recording)
 
 ## Goal
 
 Build the Execution agent (translates natural language into action sequences from saved data) and the Replay agent (deterministic playback without LLM). This is the phase where Replaybot becomes a testing tool — recordings become runnable tests.
 
+## Design Decisions
+
+| Decision | Choice | Confirmed |
+|---|---|---|
+| Multi-recording merge | Yes, full merge — interleave steps from different recordings | Yes |
+| Stale pages | Warn and skip, continue with remaining steps | Yes |
+| Dry run mode | Yes — show resolved plan for review before executing | Yes |
+| Time-dependent actions | Manual breakpoints — pause execution, user resumes | Yes |
+| Negative test auto-gen | No (decided in Phase 3) | Yes |
+| Parallel replay | No, sequential only for v1 | Yes |
+| Playwright trace | On failure only — generate trace JSON for debugging | Yes |
+| Flaky selectors | Retry first (1-2 times with backoff), then self-heal via LLM | Yes |
+| Cleanup/idempotent | No cleanup for v1 — user manages test data | Yes |
+| Test data generation | Both rule-based + LLM for complex/contextual data | Yes |
+| External data files | Yes, CSV and JSON support | Yes |
+| Report formats | JSON + Markdown for v1 | Yes |
+| MCP summary format | Both structured JSON + natural language narrative | Yes |
+
+---
+
 ## Deliverables
 
 ### 4.1 Execution Agent (`src/agents/execution.ts`)
 
-Takes a natural language test description and synthesizes a replayable action sequence from saved exploration data and recordings.
+Synthesizes replayable action sequences from saved recordings and NL descriptions.
 
-```typescript
-interface ExecutionAgent extends Agent {
-  // Core function: NL → action sequence
-  createExecution(
-    description: string,
-    options?: ExecutionOptions
-  ): Promise<ExecutionPlan>;
+- `createExecution(description, options?)` — search recordings, merge relevant ones, resolve parameters via LLM
+- `deriveExecution(recordingId, modifications, options?)` — modify an existing recording (skip steps, change params, adjust assertions)
+- **Multi-recording merge** — LLM selects and orders recordings, skips irrelevant steps, interleaves into single plan
+- **Stale page handling** — warns and skips actions targeting pages no longer in sitemap
+- **Dry run** — set `options.dryRun = true` to get the plan without executing
+- **Breakpoints** — LLM can mark actions that need manual intervention (email verification, etc.)
+- **Navigation planning** — uses sitemap pathfinding to build navigation between pages
 
-  // From existing recording with modifications
-  deriveExecution(
-    recordingId: string,
-    modifications: string      // "use a different email", "skip the newsletter step"
-  ): Promise<ExecutionPlan>;
-}
-
-interface ExecutionOptions {
-  parameters?: Record<string, string>;  // Override default parameter values
-  recordings?: string[];                // Specific recordings to draw from
-  maxSteps?: number;                    // Limit action count
-  startUrl?: string;                    // Override starting URL
-}
-
-interface ExecutionPlan {
-  id: string;
-  description: string;
-  derived_from: string[];               // Recording IDs used as source
-  parameters: Record<string, string>;   // Resolved parameter values
-  actions: ResolvedAction[];            // Ordered, ready for replay
-  assertions: ResolvedAssertion[];
-  navigation_plan: NavigationStep[];    // How to get between pages
-}
-
-interface ResolvedAction {
-  id: string;
-  order: number;
-  type: ActionType;
-  selectors: SelectorChain;
-  value?: string;                       // Parameters already resolved: "test@example.com"
-  page: {
-    url: string;
-    fingerprint: string;
-  };
-  waitBefore?: number;                  // ms to wait before action
-  waitAfter?: number;                   // ms to wait after action
-  timeout: number;                      // Max time to find element
-}
-
-interface ResolvedAssertion {
-  afterActionId: string;
-  type: AssertionType;
-  selectors?: SelectorChain;
-  expected?: string;
-  screenshotBaseline?: string;          // Path to baseline image
-  timeout: number;
-}
-```
-
-**How the Execution Agent works**:
-1. Receives NL description: "Test signup with an invalid email"
-2. Searches saved recordings and sitemap for relevant data:
-   - Finds "User signup flow" recording
-   - Finds sitemap knowledge about the signup page
-3. Synthesizes action sequence:
-   - Uses recording as skeleton
-   - Modifies parameters (email → invalid format)
-   - Adjusts assertions (expect error message instead of success)
-4. Resolves navigation:
-   - Checks current page vs. first action's page
-   - Uses sitemap to plan navigation path
-5. Outputs `ExecutionPlan` ready for Replay agent
-
-**LLM usage** (Sonnet-class):
-- Match NL description to existing recordings (semantic search)
-- Determine which parameters to modify
-- Adjust assertions for the modified scenario
-- Resolve ambiguities ("the signup page" → which URL?)
-
-**Key decisions to discuss**:
-- Should the Execution agent be able to combine steps from multiple recordings?
-  - e.g., "login, then add item to cart" = login recording + cart recording
-- How to handle recordings that reference pages that no longer exist?
-- Should there be a "dry run" mode that shows the plan without executing?
-- Should the agent generate negative/edge-case variations automatically?
-- How to handle time-dependent actions (e.g., "wait for email verification")?
-
----
+**Types**:
+- `ExecutionPlan` — id, description, derivedFrom, parameters, actions, assertions, navigationPlan, breakpoints
+- `ResolvedAction` — fully resolved action with selectors, values, page context, timeouts
+- `ResolvedAssertion` — assertion with resolved selectors and baselines
 
 ### 4.2 Replay Agent (`src/agents/replay.ts`)
 
-Deterministic playback engine. **No LLM at runtime** (except for self-healing fallback).
+Deterministic playback engine. **No LLM at runtime** except self-healing fallback.
 
-```typescript
-interface ReplayAgent extends Agent {
-  // Core replay
-  replay(
-    plan: ExecutionPlan,
-    options?: ReplayOptions
-  ): Promise<ReplayResult>;
+- `replay(plan, options?)` — full replay of an execution plan
+- `replayRecording(recordingId, params?, options?)` — replay a saved recording directly
+- `startSteppedReplay(plan, options?)` — interactive step-by-step debugging
 
-  // From saved recording directly
-  replayRecording(
-    recordingId: string,
-    params?: Record<string, string>,
-    options?: ReplayOptions
-  ): Promise<ReplayResult>;
+**Replay flow** per action:
+1. Verify page matches expected → navigate if needed (sitemap pathfinding)
+2. Resolve selector via chain fallback (aria → testid → css → text → xpath)
+3. Retry on failure (configurable count, with backoff)
+4. Self-heal via LLM if all retries fail (flag for human review)
+5. Execute action via ActionExecutor
+6. Run attached assertions
+7. Capture screenshots (on failure by default, every step optionally)
 
-  // Step-by-step (debugging)
-  startSteppedReplay(plan: ExecutionPlan): SteppedReplay;
-}
+**Self-healing**: LLM observes current page elements and finds the best match for the original selector. Always flagged `requiresReview: true`.
 
-interface ReplayOptions {
-  headed: boolean;               // Show browser window (default: false)
-  slowMotion: number;            // Delay between actions in ms (default: 0)
-  screenshotOnFailure: boolean;  // Capture screenshot on assertion fail (default: true)
-  screenshotEveryStep: boolean;  // Capture screenshot after every action (default: false)
-  video: boolean;                // Record video of replay (default: false)
-  timeout: number;               // Per-action timeout (default: 30000)
-  selfHeal: boolean;             // Enable LLM self-healing on selector failure (default: true)
-  selfHealModel: 'fast' | 'capable';  // Model tier for self-healing (default: 'fast')
-  retryCount: number;            // Retry failed actions N times (default: 1)
-  abortOnFailure: boolean;       // Stop on first failure (default: true)
-  browserType: 'chromium' | 'firefox' | 'webkit';  // default: 'chromium'
-  viewport: { width: number; height: number };
-}
+**Stepped replay**: `next()`, `skip()`, `runToEnd()`, `abort()`, `getState()` for interactive debugging.
 
-interface ReplayResult {
-  id: string;
-  plan_id: string;
-  status: 'passed' | 'failed' | 'error' | 'self_healed';
-  started_at: string;
-  finished_at: string;
-  duration_ms: number;
+**Options**: headed/headless, slow motion, screenshot policy, video, timeout, self-heal toggle, retry count, abort-on-failure, browser type, viewport, breakpoint callback.
 
-  // Per-action results
-  actionResults: ActionReplayResult[];
+### 4.3 Parameterization Engine (`src/state/parameters.ts`)
 
-  // Assertion results
-  assertionResults: AssertionReplayResult[];
+Test data generation and external data loading.
 
-  // Self-healing report
-  selfHealedActions: SelfHealReport[];
+- `generateTestData(params)` — rule-based generators (email, password, username, phone, name, string, number, boolean)
+- `generateInvalidData(params)` — invalid/edge-case values for negative testing
+- `generateContextualData(params, scenario)` — LLM-generated data for complex scenarios (falls back to rule-based)
+- `createDataSet(params, count)` — N variations for data-driven testing
+- `loadDataFile(filePath)` — load CSV or JSON parameter data files
+- `resolveTemplate(template, params)` — resolve `{{param}}` templates
 
-  // Artifacts
-  screenshots: { actionId: string; path: string }[];
-  videoPath?: string;
-  tracePath?: string;            // Playwright trace file
+**Built-in generators**: email, password, username, phone, name, string, number, boolean
+**Invalid generators**: for each type, provides common invalid values
 
-  // Summary
-  summary: {
-    totalActions: number;
-    passedActions: number;
-    failedActions: number;
-    selfHealedActions: number;
-    totalAssertions: number;
-    passedAssertions: number;
-    failedAssertions: number;
-  };
-}
+### 4.4 Report Generator (`src/reporting/generator.ts`)
 
-interface ActionReplayResult {
-  actionId: string;
-  status: 'passed' | 'failed' | 'self_healed' | 'skipped';
-  usedSelector: { strategy: string; value: string };
-  duration_ms: number;
-  error?: string;
-  screenshotPath?: string;
-}
+Test result reporting in JSON and Markdown.
 
-interface SelfHealReport {
-  actionId: string;
-  originalSelectors: SelectorChain;
-  healedSelector: { strategy: string; value: string };
-  confidence: number;
-  reasoning: string;
-  requiresReview: boolean;       // Always true — human must confirm
-}
-
-// Stepped replay for debugging
-interface SteppedReplay {
-  currentStep(): ResolvedAction;
-  next(): Promise<ActionReplayResult>;
-  skip(): void;
-  runToEnd(): Promise<ReplayResult>;
-  abort(): Promise<ReplayResult>;
-  getState(): { completed: number; remaining: number; currentPage: string };
-}
-```
-
-**Replay execution flow**:
-```
-For each action in ExecutionPlan.actions:
-  1. Verify current page matches expected page
-     - If not: attempt navigation using sitemap paths
-     - If still wrong: fail with "unexpected page state"
-
-  2. Resolve selector (chain fallback):
-     - Try selector[0] (ARIA) → found? → use it
-     - Try selector[1] (testid) → found? → use it
-     - Try selector[2] (CSS) → found? → use it
-     - ...
-     - All failed? → if selfHeal enabled:
-       - Capture page state
-       - Call LLM: "Element was previously at {selectors}. Current page: {state}. Find it."
-       - LLM returns new selector → verify → use → flag for review
-       - If LLM fails → fail action
-
-  3. Execute action (click/type/navigate/etc.)
-     - Apply waitBefore if set
-     - Execute via ActionExecutor
-     - Apply waitAfter if set
-
-  4. Run assertions (if any attached to this action)
-     - Element assertions: check visibility/text/value
-     - Visual assertions: compare to baseline screenshot
-     - Custom assertions: evaluate
-
-  5. Capture artifacts (screenshots, timing)
-
-  6. Record result
-```
-
-**Key decisions to discuss**:
-- Should replay support parallel execution (multiple browsers for different parameter sets)?
-- How to integrate with CI/CD? (Exit codes? JUnit XML reports? Custom reporter?)
-- Should replay auto-generate a Playwright trace for debugging failures?
-- How to handle flaky selectors that sometimes work, sometimes don't?
-  - Retry with backoff? Mark as flaky in results?
-- Should the stepped replay mode support a web UI for visual debugging?
-- Should replays be idempotent? (e.g., clean up created data after test)
+- `toJSON(result)` — full structured JSON report
+- `toMarkdown(result)` — human-readable report with tables, failed action details, self-healing report, artifacts
+- `toMCPSummary(result)` — both structured JSON summary and natural language narrative for AI assistants
+- `toHealingReport(result)` — dedicated report for self-healed selectors requiring review
 
 ---
 
-### 4.3 Parameterization Engine
+## File Structure
 
-Built into the recording/replay pipeline but detailed here.
-
-```typescript
-interface ParameterEngine {
-  // Template resolution
-  resolveTemplate(template: string, params: Record<string, string>): string;
-  // e.g., "{{email}}" + {email: "test@x.com"} → "test@x.com"
-
-  // Auto-detection during recording
-  detectParameters(actions: ActionRecord[]): ParameterDef[];
-  // Finds values that look like emails, passwords, names, etc.
-
-  // Data generation
-  generateTestData(params: ParameterDef[], scenario: string): Record<string, string>;
-  // e.g., scenario="invalid" → {email: "not-an-email", password: "short"}
-
-  // Data sets for batch replay
-  createDataSet(params: ParameterDef[], count: number): Record<string, string>[];
-  // Generates N variations for data-driven testing
-}
 ```
+src/agents/
+├── execution.ts         # ExecutionAgent (NL → action sequence, multi-recording merge)
+├── replay.ts            # ReplayAgent (deterministic playback, self-healing, stepped)
+├── planner.ts           # PlannerAgent (Phase 3)
+├── types.ts             # BaseAgent, AgentContext (Phase 2)
+├── scout.ts             # ScoutAgent (Phase 2)
+├── deep-explorer.ts     # DeepExplorerAgent (Phase 2)
+└── orchestrator.ts      # Orchestrator (Phase 2)
 
-**Key decisions to discuss**:
-- Should parameter generation use an LLM or rule-based generators?
-- Should we support data files (CSV/JSON) as parameter sources?
-- How to handle dependent parameters? (e.g., "if country=US, state must be a US state")
-- Should there be built-in generators for common types? (fake names, emails, addresses)
+src/state/
+├── parameters.ts        # ParameterEngine (rule-based + LLM, CSV/JSON)
+├── recordings.ts        # RecordingManager (Phase 3)
+├── page-state.ts        # PageStateManager (Phase 1)
+└── sitemap.ts           # SiteMapManager (Phase 1-2)
+
+src/reporting/
+└── generator.ts         # ReportGenerator (JSON, Markdown, MCP summary)
+
+src/assertions/
+├── element.ts           # ElementAssertionEngine (Phase 3)
+├── visual.ts            # VisualAssertionEngine (Phase 3)
+└── custom.ts            # CustomAssertionEngine (Phase 3)
+```
 
 ---
 
-### 4.4 Test Result Reporting
-
-```typescript
-interface ReportGenerator {
-  // Output formats
-  toJSON(result: ReplayResult): string;
-  toJUnitXML(result: ReplayResult): string;     // CI/CD integration
-  toHTML(result: ReplayResult): string;          // Human-readable report
-  toMarkdown(result: ReplayResult): string;      // For PR comments
-
-  // Summary for MCP response
-  toMCPSummary(result: ReplayResult): string;    // Concise text for AI assistant
-
-  // Diff report when self-healing occurred
-  toHealingReport(result: ReplayResult): string;
-}
-```
-
-**Key decisions to discuss**:
-- Which report formats are essential for v1?
-- Should reports include embedded screenshots or reference external files?
-- Should we post results as GitHub PR comments automatically?
-- Should the MCP summary be structured (JSON) or natural language?
-
----
-
-## Data Flow (Phase 4)
+## Data Flow
 
 ```
-User (via AI assistant): "Run the signup test with invalid email"
+User: "Run the signup test with invalid email"
         │
         ▼
    ┌───────────┐
    │ Execution │──── searches ────► saved recordings
    │   Agent   │──── consults ────► sitemap
+   │           │──── merges  ─────► multiple recordings
    └─────┬─────┘
-         │ ExecutionPlan
+         │ ExecutionPlan (with breakpoints)
          ▼
    ┌───────────┐
    │  Replay   │──── drives ──────► Playwright browser
-   │   Agent   │──── checks ──────► assertion engine
+   │   Agent   │──── retries ─────► selector chain fallback
+   │           │──── self-heals ──► LLM (on failure only)
+   │           │──── checks ──────► assertion engines
    └─────┬─────┘
          │ ReplayResult
          ▼
    ┌───────────┐
-   │  Report   │──── outputs ─────► JSON / JUnit / HTML / Markdown
-   │ Generator │
+   │  Report   │──── JSON ────────► machine consumption
+   │ Generator │──── Markdown ────► PR comments / humans
+   │           │──── MCP ─────────► AI assistant summary
    └───────────┘
 ```
 
-## Testing Strategy (Phase 4)
-
-- **Execution agent tests**: Mock LLM + saved recordings → verify correct action sequence generation
-- **Replay tests**: Pre-recorded JSON → replay against test site → verify outcomes
-- **Self-healing tests**: Intentionally break selectors, verify LLM fallback works
-- **Parameterization tests**: Template resolution, data generation, batch replay
-- **Report tests**: Verify output format correctness
-
 ## Phase 4 Exit Criteria
 
-- [ ] Execution agent creates action sequences from NL descriptions
-- [ ] Replay agent runs recordings deterministically without LLM
-- [ ] Selector chaining works with fallback through all strategies
-- [ ] Self-healing engages on selector failure, flags for review
-- [ ] Parameterization resolves templates in actions
-- [ ] Test results reported in at least JSON + Markdown format
-- [ ] Full loop works: record → parameterize → replay with different data
+- [x] Execution agent creates action sequences from NL descriptions
+- [x] Execution agent merges multiple recordings into one plan
+- [x] Execution agent supports dry run mode
+- [x] Execution agent handles stale pages (warn and skip)
+- [x] Execution agent supports manual breakpoints
+- [x] Replay agent runs recordings deterministically without LLM
+- [x] Selector chaining works with fallback through all strategies
+- [x] Self-healing engages after retries fail, flags for review
+- [x] Stepped replay for interactive debugging
+- [x] Parameterization with rule-based + LLM generators
+- [x] CSV/JSON external data file loading
+- [x] Test results reported in JSON + Markdown
+- [x] MCP summary with structured + narrative formats
+- [x] TypeScript compiles cleanly
 - [ ] All tests pass

@@ -87,6 +87,32 @@ export type { VisualDiff, CompareOptions, BoundingBox } from './assertions/visua
 export { CustomAssertionEngine } from './assertions/custom.js';
 export type { CustomAssertionFn } from './assertions/custom.js';
 
+// Phase 4: Execution, Replay, Parameterization, Reporting
+
+export { ExecutionAgent } from './agents/execution.js';
+export type {
+  ExecutionPlan,
+  ResolvedAction,
+  ResolvedAssertion,
+  ExecutionOptions,
+} from './agents/execution.js';
+
+export { ReplayAgent } from './agents/replay.js';
+export type {
+  ReplayOptions,
+  ReplayResult,
+  ReplaySummary,
+  ActionReplayResult,
+  AssertionReplayResult,
+  SelfHealReport,
+  SteppedReplay,
+} from './agents/replay.js';
+
+export { ParameterEngine } from './state/parameters.js';
+
+export { ReportGenerator } from './reporting/generator.js';
+export type { MCPSummary, MCPStructuredSummary } from './reporting/generator.js';
+
 // Shared types
 
 export type {
